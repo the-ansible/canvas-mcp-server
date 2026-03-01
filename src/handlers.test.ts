@@ -189,7 +189,7 @@ describe('MCP Tool Handlers', () => {
       expect(result.isError).toBeUndefined();
       const parsed = parseResult(result);
       expect(parsed.url).toContain('canvasId=abc-123');
-      expect(parsed.url).toContain('localhost:3003/apps/canvas-ui');
+      expect(parsed.url).toContain('localhost:3003/apps/canvas/');
     });
 
     it('should propagate 404 for non-existent canvas', async () => {

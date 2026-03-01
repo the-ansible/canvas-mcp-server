@@ -8,14 +8,16 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { waitForCanvasEvent } from './ws-client.js';
+
 // API base URL for the Dynamic UI Canvas server
 const API_BASE_URL = 'http://localhost:3001/api';
 
-// Web app URL where users can view canvases in the browser (via gateway)
-const CANVAS_WEB_APP_URL = 'http://localhost:3003/apps/canvas-ui/';
+// Web app URL where users can view canvases in the browser (via Caddy gateway on :3003)
+const CANVAS_WEB_APP_URL = 'http://localhost:3003/apps/canvas/';
 
-// Outbound messaging webhook for notifying the user
-const OUTBOUND_WEBHOOK_URL = 'http://life-system-n8n:5678/webhook/jane/simple-stimulation/response';
+// Outbound messaging — routes through stimulation server composer for voice consistency
+const OUTBOUND_WEBHOOK_URL = 'http://localhost:3102/api/compose-and-send';
 
 // Types matching the Canvas API
 interface Canvas {
@@ -554,8 +556,8 @@ const tools: Tool[] = [
     name: 'wait_for_event',
     description:
       'Blocks until a matching event arrives on an existing canvas, then returns it. ' +
+      'Uses a WebSocket subscription for instant notification — no polling delay. ' +
       'Use this to wait for user interactions — form submissions, button clicks, game moves, etc. ' +
-      'The tool polls for pending events, and when a match is found, acknowledges it and returns the event data. ' +
       'This is the preferred way to implement turn-based interactions or await user input on a canvas you already created.',
     inputSchema: {
       type: 'object',
@@ -564,7 +566,6 @@ const tools: Tool[] = [
         componentId: { type: 'string', description: 'Only match events from this component (optional)' },
         eventType: { type: 'string', description: 'Only match this event type, e.g. "submit", "click" (default: any)' },
         timeoutSeconds: { type: 'number', description: 'Max seconds to wait (default: 300, max: 3600)' },
-        pollIntervalSeconds: { type: 'number', description: 'Seconds between polls (default: 2)' },
         acknowledge: { type: 'boolean', description: 'Auto-acknowledge the matched event (default: true)' },
       },
       required: ['canvasId'],
@@ -824,10 +825,6 @@ const tools: Tool[] = [
           type: 'number',
           description: 'How long to wait for a response in seconds (default: 300 = 5 minutes, max: 3600)',
         },
-        pollIntervalSeconds: {
-          type: 'number',
-          description: 'How often to poll for events in seconds (default: 3)',
-        },
       },
       required: ['title', 'message', 'fields'],
     },
@@ -883,10 +880,6 @@ const tools: Tool[] = [
         timeoutSeconds: {
           type: 'number',
           description: 'How long to wait for interaction in seconds (default: 300 = 5 minutes, max: 3600)',
-        },
-        pollIntervalSeconds: {
-          type: 'number',
-          description: 'How often to poll for events in seconds (default: 3)',
         },
         notifyUser: {
           type: 'boolean',
@@ -1793,7 +1786,7 @@ export async function handleToolCall(
       }
 
       case 'request_user_input': {
-        const { title, message, fields, submitLabel, description, timeoutSeconds, pollIntervalSeconds } = args as {
+        const { title, message, fields, submitLabel, description, timeoutSeconds } = args as {
           title: string;
           message: string;
           fields: Array<{
@@ -1808,14 +1801,12 @@ export async function handleToolCall(
           submitLabel?: string;
           description?: string;
           timeoutSeconds?: number;
-          pollIntervalSeconds?: number;
         };
         validateString(title, 'title', true);
         validateString(message, 'message', true);
         validateArray(fields, 'fields', true);
 
         const timeout = Math.min(timeoutSeconds ?? 300, 3600) * 1000;
-        const pollInterval = (pollIntervalSeconds ?? 3) * 1000;
 
         // Build form children from field definitions (same logic as show_form)
         const formChildren: object[] = [];
@@ -1945,42 +1936,61 @@ export async function handleToolCall(
           await fetch(OUTBOUND_WEBHOOK_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: `${message}\n\n${url}` }),
+            body: JSON.stringify({ message: `${message}\n\n${url}`, source: 'canvas' }),
             signal: AbortSignal.timeout(10000),
           });
         } catch {
           // Webhook delivery failed — user can still access the URL if they have it
         }
 
-        // 3. Poll for submit event
-        const startTime = Date.now();
+        // 3. Check for already-pending submit events (race condition guard)
         let submitData: unknown = null;
         let timedOut = false;
 
-        while (Date.now() - startTime < timeout) {
-          const pending = await apiCall<PendingEventsResponse>(
-            `/canvases/${canvas.id}/events/pending`
-          );
+        const pending = await apiCall<PendingEventsResponse>(
+          `/canvases/${canvas.id}/events/pending`
+        );
+        const alreadyPending = pending.events.find(
+          (e: any) => (e.event_type ?? e.eventType) === 'submit'
+        );
 
-          const submitEvent = pending.events.find(
-            (e: any) => (e.event_type ?? e.eventType) === 'submit'
+        if (alreadyPending) {
+          submitData = (alreadyPending.payload as Record<string, unknown>)?.value ?? alreadyPending.payload;
+          await apiCall<AcknowledgeResponse>(
+            `/canvases/${canvas.id}/events/${alreadyPending.id}/acknowledge`,
+            { method: 'POST' }
           );
+        } else {
+          // 4. Wait for submit event via WebSocket
+          const wsResult = await waitForCanvasEvent({
+            canvasId: canvas.id,
+            eventType: 'submit',
+            timeoutMs: timeout,
+          });
 
-          if (submitEvent) {
-            submitData = (submitEvent.payload as Record<string, unknown>)?.value ?? submitEvent.payload;
+          if (wsResult) {
+            // Fetch full event payload from API (WebSocket broadcast may not include all fields)
+            try {
+              const eventDetail = await apiCall<{ events: CanvasEvent[]; total: number }>(
+                `/canvases/${canvas.id}/events?limit=1&offset=0`
+              );
+              const latestSubmit = eventDetail.events?.find(
+                (e: any) => e.id === wsResult.eventId
+              );
+              submitData = latestSubmit
+                ? (latestSubmit.payload as Record<string, unknown>)?.value ?? latestSubmit.payload
+                : wsResult.payload ?? wsResult.value;
+            } catch {
+              submitData = wsResult.payload ?? wsResult.value;
+            }
             // Acknowledge the event
             await apiCall<AcknowledgeResponse>(
-              `/canvases/${canvas.id}/events/${submitEvent.id}/acknowledge`,
+              `/canvases/${canvas.id}/events/${wsResult.eventId}/acknowledge`,
               { method: 'POST' }
             );
-            break;
+          } else {
+            timedOut = true;
           }
-
-          await new Promise((resolve) => setTimeout(resolve, pollInterval));
-        }
-
-        if (!submitData) {
-          timedOut = true;
         }
 
         return {
@@ -2003,7 +2013,6 @@ export async function handleToolCall(
           components: iComponents,
           waitForEventTypes,
           timeoutSeconds: iTimeout,
-          pollIntervalSeconds: iPoll,
           notifyUser,
         } = args as {
           title: string;
@@ -2011,7 +2020,6 @@ export async function handleToolCall(
           components: unknown[];
           waitForEventTypes?: string[];
           timeoutSeconds?: number;
-          pollIntervalSeconds?: number;
           notifyUser?: boolean;
         };
         validateString(iTitle, 'title', true);
@@ -2019,7 +2027,6 @@ export async function handleToolCall(
         validateArray(iComponents, 'components', true);
 
         const iTimeoutMs = Math.min(iTimeout ?? 300, 3600) * 1000;
-        const iPollMs = (iPoll ?? 3) * 1000;
         const targetEvents = waitForEventTypes ?? ['submit'];
         const shouldNotify = notifyUser !== false;
 
@@ -2037,7 +2044,7 @@ export async function handleToolCall(
             await fetch(OUTBOUND_WEBHOOK_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message: `${iMessage}\n\n${iUrl}` }),
+              body: JSON.stringify({ message: `${iMessage}\n\n${iUrl}`, source: 'canvas' }),
               signal: AbortSignal.timeout(10000),
             });
           } catch {
@@ -2045,30 +2052,74 @@ export async function handleToolCall(
           }
         }
 
-        // 3. Poll for matching events
-        const iStart = Date.now();
+        // 3. Check for already-pending matching events (race condition guard)
         let matchedEvent: Record<string, unknown> | null = null;
 
-        while (Date.now() - iStart < iTimeoutMs) {
-          const iPending = await apiCall<PendingEventsResponse>(
-            `/canvases/${iCanvas.id}/events/pending`
-          );
+        const iPending = await apiCall<PendingEventsResponse>(
+          `/canvases/${iCanvas.id}/events/pending`
+        );
+        const alreadyFound = iPending.events.find(
+          (e: any) => targetEvents.includes(e.event_type ?? e.eventType)
+        );
 
-          const found = iPending.events.find(
-            (e: any) => targetEvents.includes(e.event_type ?? e.eventType)
+        if (alreadyFound) {
+          matchedEvent = alreadyFound as unknown as Record<string, unknown>;
+          await apiCall<AcknowledgeResponse>(
+            `/canvases/${iCanvas.id}/events/${alreadyFound.id}/acknowledge`,
+            { method: 'POST' }
           );
+        } else {
+          // 4. Wait for event via WebSocket
+          // For multiple target event types, we can't filter by a single eventType,
+          // so we listen for any event and filter in the result
+          const wsEventType = targetEvents.length === 1 ? targetEvents[0] : undefined;
+          const wsResult = await waitForCanvasEvent({
+            canvasId: iCanvas.id,
+            eventType: wsEventType,
+            timeoutMs: iTimeoutMs,
+          });
 
-          if (found) {
-            matchedEvent = found as unknown as Record<string, unknown>;
-            // Acknowledge
-            await apiCall<AcknowledgeResponse>(
-              `/canvases/${iCanvas.id}/events/${found.id}/acknowledge`,
-              { method: 'POST' }
-            );
-            break;
+          if (wsResult) {
+            // If multiple target types, verify the match
+            if (!wsEventType && !targetEvents.includes(wsResult.eventType)) {
+              // Didn't match — treat as timeout (edge case)
+            } else {
+              // Fetch the full event from the API for complete payload
+              try {
+                const pendingCheck = await apiCall<PendingEventsResponse>(
+                  `/canvases/${iCanvas.id}/events/pending`
+                );
+                const fullEvent = pendingCheck.events.find((e: any) => e.id === wsResult.eventId);
+                if (fullEvent) {
+                  matchedEvent = fullEvent as unknown as Record<string, unknown>;
+                } else {
+                  // Event may have been auto-acked; construct from WS data
+                  matchedEvent = {
+                    id: wsResult.eventId,
+                    event_type: wsResult.eventType,
+                    payload: {
+                      componentId: wsResult.componentId,
+                      value: wsResult.value,
+                    },
+                  };
+                }
+              } catch {
+                matchedEvent = {
+                  id: wsResult.eventId,
+                  event_type: wsResult.eventType,
+                  payload: {
+                    componentId: wsResult.componentId,
+                    value: wsResult.value,
+                  },
+                };
+              }
+              // Acknowledge
+              await apiCall<AcknowledgeResponse>(
+                `/canvases/${iCanvas.id}/events/${wsResult.eventId}/acknowledge`,
+                { method: 'POST' }
+              );
+            }
           }
-
-          await new Promise((resolve) => setTimeout(resolve, iPollMs));
         }
 
         return {
@@ -2095,50 +2146,83 @@ export async function handleToolCall(
           componentId: weComponentId,
           eventType: weEventType,
           timeoutSeconds: weTimeout,
-          pollIntervalSeconds: wePoll,
           acknowledge: weAck,
         } = args as {
           canvasId: string;
           componentId?: string;
           eventType?: string;
           timeoutSeconds?: number;
-          pollIntervalSeconds?: number;
           acknowledge?: boolean;
         };
         validateString(weCanvasId, 'canvasId', true);
 
         const weTimeoutMs = Math.min(weTimeout ?? 300, 3600) * 1000;
-        const wePollMs = (wePoll ?? 2) * 1000;
         const shouldAck = weAck !== false;
-
-        const weStart = Date.now();
         let weMatch: Record<string, unknown> | null = null;
 
-        while (Date.now() - weStart < weTimeoutMs) {
-          const wePending = await apiCall<PendingEventsResponse>(
-            `/canvases/${weCanvasId}/events/pending`
-          );
+        // 1. Check for already-pending events first (race condition guard)
+        const wePending = await apiCall<PendingEventsResponse>(
+          `/canvases/${weCanvasId}/events/pending`
+        );
 
-          const found = wePending.events.find((e: any) => {
-            const eType = e.event_type ?? e.eventType;
-            const eCompId = e.payload?.componentId;
-            if (weEventType && eType !== weEventType) return false;
-            if (weComponentId && eCompId !== weComponentId) return false;
-            return true;
+        const alreadyPending = wePending.events.find((e: any) => {
+          const eType = e.event_type ?? e.eventType;
+          const eCompId = e.payload?.componentId;
+          if (weEventType && eType !== weEventType) return false;
+          if (weComponentId && eCompId !== weComponentId) return false;
+          return true;
+        });
+
+        if (alreadyPending) {
+          weMatch = alreadyPending as unknown as Record<string, unknown>;
+        } else {
+          // 2. Wait for event via WebSocket
+          const wsResult = await waitForCanvasEvent({
+            canvasId: weCanvasId,
+            componentId: weComponentId,
+            eventType: weEventType,
+            timeoutMs: weTimeoutMs,
           });
 
-          if (found) {
-            weMatch = found as unknown as Record<string, unknown>;
-            if (shouldAck) {
-              await apiCall<AcknowledgeResponse>(
-                `/canvases/${weCanvasId}/events/${found.id}/acknowledge`,
-                { method: 'POST' }
+          if (wsResult) {
+            // Fetch the full event from the pending events API for complete payload
+            try {
+              const postWsPending = await apiCall<PendingEventsResponse>(
+                `/canvases/${weCanvasId}/events/pending`
               );
+              const fullEvent = postWsPending.events.find((e: any) => e.id === wsResult.eventId);
+              if (fullEvent) {
+                weMatch = fullEvent as unknown as Record<string, unknown>;
+              } else {
+                // Construct from WebSocket data
+                weMatch = {
+                  id: wsResult.eventId,
+                  event_type: wsResult.eventType,
+                  payload: {
+                    componentId: wsResult.componentId,
+                    value: wsResult.value,
+                  },
+                };
+              }
+            } catch {
+              weMatch = {
+                id: wsResult.eventId,
+                event_type: wsResult.eventType,
+                payload: {
+                  componentId: wsResult.componentId,
+                  value: wsResult.value,
+                },
+              };
             }
-            break;
           }
+        }
 
-          await new Promise((resolve) => setTimeout(resolve, wePollMs));
+        // 3. Acknowledge if matched
+        if (weMatch && shouldAck) {
+          await apiCall<AcknowledgeResponse>(
+            `/canvases/${weCanvasId}/events/${(weMatch as any).id}/acknowledge`,
+            { method: 'POST' }
+          );
         }
 
         return {
