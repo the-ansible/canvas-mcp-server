@@ -16,8 +16,8 @@ const API_BASE_URL = 'http://localhost:3001/api';
 // Web app URL where users can view canvases in the browser (via Caddy gateway on :3003)
 const CANVAS_WEB_APP_URL = 'http://localhost:3003/apps/canvas/';
 
-// Outbound messaging — routes through stimulation server composer for voice consistency
-const OUTBOUND_WEBHOOK_URL = 'http://localhost:3102/api/compose-and-send';
+// Outbound messaging — routes through brain server composer for voice consistency
+const OUTBOUND_WEBHOOK_URL = 'http://localhost:3103/api/communication/compose-and-send';
 
 // Types matching the Canvas API
 interface Canvas {
